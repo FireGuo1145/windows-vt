@@ -144,7 +144,7 @@ fn create_pipe_pair() -> windows::core::Result<(HANDLE, HANDLE)> {
     Ok((read, write))
 }
 
-fn launch_cmd() -> windows::core::Result<(HANDLE, HANDLE, HANDLE, HPCON)> {
+fn launch_cmd(desktop_name: &str) -> windows::core::Result<(HANDLE, HANDLE, HANDLE, HPCON)> {
     let (input_read, input_write) = create_pipe_pair()?;
     let (output_read, output_write) = create_pipe_pair()?;
     unsafe {
@@ -192,10 +192,12 @@ fn launch_cmd() -> windows::core::Result<(HANDLE, HANDLE, HANDLE, HPCON)> {
     // Use an explicit system path so process startup does not depend on the
     // working directory or PATH inherited by the virtual Desktop.
     let executable = to_wide(r"C:\Windows\System32\cmd.exe");
-    let mut command = to_wide("/Q");
+    let mut command = to_wide("\"C:\\Windows\\System32\\cmd.exe\" /D /Q");
+    let mut desktop_name = to_wide(desktop_name);
     let mut startup = STARTUPINFOEXW {
         StartupInfo: STARTUPINFOW {
             cb: size_of::<STARTUPINFOEXW>() as u32,
+            lpDesktop: PWSTR(desktop_name.as_mut_ptr()),
             ..Default::default()
         },
         lpAttributeList: attributes,
@@ -226,9 +228,20 @@ fn launch_cmd() -> windows::core::Result<(HANDLE, HANDLE, HANDLE, HPCON)> {
     Ok((input_write, output_read, process_info.hProcess, pty))
 }
 
-fn host_thread(desktop: HDESK, ready_tx: mpsc::SyncSender<HostReady>) {
-    let _ = unsafe { SetThreadDesktop(desktop) };
-    let (input_write, output_read, process, pty) = match launch_cmd() {
+fn host_thread(desktop: HDESK, desktop_name: String, ready_tx: mpsc::SyncSender<HostReady>) {
+    if let Err(error) = unsafe { SetThreadDesktop(desktop) } {
+        let text = to_wide(&format!("绑定 Desktop 失败: {error}"));
+        unsafe {
+            MessageBoxW(
+                None,
+                PCWSTR(text.as_ptr()),
+                w!("Virtual Desktop"),
+                windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+            );
+        }
+        return;
+    }
+    let (input_write, output_read, process, pty) = match launch_cmd(&desktop_name) {
         Ok(value) => value,
         Err(error) => {
             let text = to_wide(&format!("无法启动终端: {error}"));
@@ -593,10 +606,16 @@ impl AppState {
             };
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let desktop_raw = desktop.0 as usize;
+            let desktop_name_for_host = format!("VirtualDesktop{}", index + 1);
             let join = match thread::Builder::new()
                 .name(format!("desktop-host-{}", index + 1))
-                .spawn(move || host_thread(HDESK(desktop_raw as *mut c_void), ready_tx))
-            {
+                .spawn(move || {
+                    host_thread(
+                        HDESK(desktop_raw as *mut c_void),
+                        desktop_name_for_host,
+                        ready_tx,
+                    )
+                }) {
                 Ok(join) => join,
                 Err(_) => {
                     unsafe {
