@@ -175,7 +175,9 @@ fn launch_cmd(desktop_name: &str) -> windows::core::Result<(HANDLE, HANDLE, HAND
                     attributes,
                     0,
                     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                    Some(&pty.0 as *const _ as *const c_void),
+                    // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE expects the HPCON
+                    // handle value, not the address of the local variable.
+                    Some(pty.0 as *const c_void),
                     size_of::<HPCON>(),
                     None,
                     None,
