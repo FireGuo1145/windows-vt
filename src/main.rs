@@ -32,9 +32,9 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-    TerminateProcess, UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-    STARTUPINFOEXW, STARTUPINFOW,
+    TerminateProcess, UpdateProcThreadAttribute, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW, STARTUPINFOW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, RegisterHotKey, SetFocus, UnregisterHotKey, MOD_ALT, MOD_CONTROL, VK_C,
@@ -140,7 +140,6 @@ fn create_pipe_pair() -> windows::core::Result<(HANDLE, HANDLE)> {
     };
     unsafe {
         windows::Win32::System::Pipes::CreatePipe(&mut read, &mut write, Some(&mut security), 0)?;
-        SetHandleInformation(read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))?;
     }
     Ok((read, write))
 }
@@ -148,6 +147,10 @@ fn create_pipe_pair() -> windows::core::Result<(HANDLE, HANDLE)> {
 fn launch_cmd() -> windows::core::Result<(HANDLE, HANDLE, HANDLE, HPCON)> {
     let (input_read, input_write) = create_pipe_pair()?;
     let (output_read, output_write) = create_pipe_pair()?;
+    unsafe {
+        SetHandleInformation(input_write, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))?;
+        SetHandleInformation(output_read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))?;
+    }
     let size = windows::Win32::System::Console::COORD { X: 120, Y: 40 };
     let pty = unsafe { CreatePseudoConsole(size, input_read, output_write, 0)? };
     unsafe {
@@ -186,7 +189,10 @@ fn launch_cmd() -> windows::core::Result<(HANDLE, HANDLE, HANDLE, HPCON)> {
         return Err(error);
     }
 
-    let mut command = to_wide("cmd.exe /Q");
+    // Use an explicit system path so process startup does not depend on the
+    // working directory or PATH inherited by the virtual Desktop.
+    let executable = to_wide(r"C:\Windows\System32\cmd.exe");
+    let mut command = to_wide("/Q");
     let mut startup = STARTUPINFOEXW {
         StartupInfo: STARTUPINFOW {
             cb: size_of::<STARTUPINFOEXW>() as u32,
@@ -197,12 +203,12 @@ fn launch_cmd() -> windows::core::Result<(HANDLE, HANDLE, HANDLE, HPCON)> {
     let mut process_info = PROCESS_INFORMATION::default();
     let created = unsafe {
         CreateProcessW(
-            None,
+            PCWSTR(executable.as_ptr()),
             Some(PWSTR(command.as_mut_ptr())),
             None,
             None,
             false,
-            EXTENDED_STARTUPINFO_PRESENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
             None,
             None,
             &mut startup.StartupInfo,
