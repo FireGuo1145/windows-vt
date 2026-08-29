@@ -44,9 +44,9 @@ use windows::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW, STARTUPINFOW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, RegisterHotKey, SetFocus, UnregisterHotKey, MOD_ALT, MOD_CONTROL, VK_BACK, VK_C,
-    VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_HOME, VK_LEFT,
-    VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
+    GetKeyState, RegisterHotKey, SetFocus, UnregisterHotKey, MOD_ALT, MOD_CONTROL, VK_C, VK_DOWN,
+    VK_END, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RIGHT, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -576,10 +576,6 @@ fn send_input(handle: HANDLE, bytes: &[u8]) {
 
 fn key_sequence(key: u16) -> Option<&'static [u8]> {
     match key {
-        k if k == VK_RETURN.0 as u16 => Some(b"\r"),
-        k if k == VK_BACK.0 as u16 => Some(b"\x7f"),
-        k if k == VK_TAB.0 as u16 => Some(b"\t"),
-        k if k == VK_ESCAPE.0 as u16 => Some(b"\x1b"),
         k if k == VK_UP.0 as u16 => Some(b"\x1b[A"),
         k if k == VK_DOWN.0 as u16 => Some(b"\x1b[B"),
         k if k == VK_RIGHT.0 as u16 => Some(b"\x1b[C"),
