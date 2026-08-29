@@ -28,3 +28,11 @@ target\release\virtual_desktop_terminal.exe
 宿主使用 ConPTY 连接 `cmd.exe`，键盘输入直接写入伪控制台。输出由 `vt100` 状态机解析，支持 VT/ANSI 的屏幕缓冲、光标定位、清屏、滚动、备用屏幕、颜色、宽字符、inverse 和 underline，因此 `cmd` 的全屏 TUI 可以使用自己的屏幕状态。
 
 窗口使用 Per-Monitor DPI Aware V2。字体大小、字符单元格和 ConPTY 行列数会按窗口 DPI 与尺寸同步调整，并绘制 Linux 风格的闪烁块光标。
+
+## 作者信息
+
+FireGuo（fireguo@flweb.cn）
+
+B站：风梨-FireGuo
+
+本项目使用GPT-5.6制作
