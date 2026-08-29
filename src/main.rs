@@ -7,6 +7,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use vt100::{Color as VtColor, Parser};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -37,7 +38,9 @@ use windows::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW, STARTUPINFOW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, RegisterHotKey, SetFocus, UnregisterHotKey, MOD_ALT, MOD_CONTROL, VK_C,
+    GetKeyState, RegisterHotKey, SetFocus, UnregisterHotKey, MOD_ALT, MOD_CONTROL, VK_BACK, VK_C,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_HOME, VK_LEFT,
+    VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -46,12 +49,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsWindow,
     LoadCursorW, LoadIconW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOPMOST,
     IDC_ARROW, IDI_APPLICATION, MF_STRING, MSG, SWP_SHOWWINDOW, SW_SHOW, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE,
-    WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP,
+    TPM_LEFTALIGN, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_HOTKEY,
+    WM_KEYDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR,
+    WM_SIZE, WM_TIMER, WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 const WM_TRAY: u32 = WM_USER + 1;
@@ -60,6 +64,7 @@ const WM_ACTIVATE_HOST: u32 = WM_APP + 2;
 const ID_EXIT: usize = 1001;
 const HOTKEY_BASE: i32 = 1;
 const DESKTOP_ACCESS: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0080 | 0x0100;
+const CURSOR_TIMER: usize = 1;
 
 #[derive(Clone)]
 struct HostShared {
@@ -74,7 +79,13 @@ struct HostState {
     process: HANDLE,
     pty: HPCON,
     font: HFONT,
-    text: String,
+    parser: Parser,
+    dpi: u32,
+    cell_width: i32,
+    cell_height: i32,
+    rows: u16,
+    cols: u16,
+    cursor_visible: bool,
 }
 
 struct HostReady {
@@ -317,7 +328,13 @@ fn host_thread(desktop: HDESK, desktop_name: String, ready_tx: mpsc::SyncSender<
         process,
         pty,
         font,
-        text: String::new(),
+        parser: Parser::new(40, 120, 10_000),
+        dpi: 96,
+        cell_width: 10,
+        cell_height: 20,
+        rows: 40,
+        cols: 120,
+        cursor_visible: true,
     });
     let raw_state = Box::into_raw(state);
     let hwnd = unsafe {
@@ -339,6 +356,9 @@ fn host_thread(desktop: HDESK, desktop_name: String, ready_tx: mpsc::SyncSender<
     };
     if let Ok(mut slot) = hwnd_slot.lock() {
         *slot = Some(hwnd.0 as usize);
+    }
+    unsafe {
+        SetTimer(Some(hwnd), CURSOR_TIMER, 500, None);
     }
     let ready = HostReady {
         hwnd: hwnd.0 as usize,
@@ -371,6 +391,10 @@ unsafe extern "system" fn terminal_wnd_proc(
     if message == WM_NCCREATE {
         let create = &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+        update_font(
+            &mut *(create.lpCreateParams as *mut HostState),
+            windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd),
+        );
         SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -390,12 +414,7 @@ unsafe extern "system" fn terminal_wnd_proc(
         WM_OUTPUT => {
             if let Ok(mut bytes) = state.shared.output.lock() {
                 let chunk = std::mem::take(&mut *bytes);
-                state
-                    .text
-                    .push_str(&clean_terminal_output(&String::from_utf8_lossy(&chunk)));
-                if state.text.len() > 2_000_000 {
-                    state.text.drain(..500_000);
-                }
+                state.parser.process(&chunk);
             }
             InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
@@ -408,31 +427,51 @@ unsafe extern "system" fn terminal_wnd_proc(
         }
         WM_CHAR => {
             let ch = wparam.0 as u16;
-            if ch == 3 {
-                return LRESULT(0);
+            if ch != 3 {
+                send_input(
+                    state.input_write,
+                    &String::from_utf16_lossy(&[ch]).into_bytes(),
+                );
             }
-            let utf8 = String::from_utf16_lossy(&[ch]);
-            send_input(state.input_write, utf8.as_bytes());
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            if wparam.0 as u16 == VK_C.0 as u16
+            let key = wparam.0 as u16;
+            if key == VK_C.0 as u16
                 && GetKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32) < 0
             {
                 send_input(state.input_write, &[3]);
+            } else if let Some(sequence) = key_sequence(key) {
+                send_input(state.input_write, sequence);
             }
             LRESULT(0)
         }
         WM_SIZE => {
-            let width = (lparam.0 as u32 & 0xffff) as i16 as i16;
-            let height = ((lparam.0 as u32 >> 16) & 0xffff) as i16 as i16;
+            let width = (lparam.0 as u32 & 0xffff) as i32;
+            let height = ((lparam.0 as u32 >> 16) & 0xffff) as i32;
+            let cols = (width / state.cell_width.max(1)).clamp(20, 300) as u16;
+            let rows = (height / state.cell_height.max(1)).clamp(5, 120) as u16;
+            state.cols = cols;
+            state.rows = rows;
+            state.parser.set_size(rows, cols);
             let _ = ResizePseudoConsole(
                 state.pty,
                 windows::Win32::System::Console::COORD {
-                    X: (width as i32 / 10).max(20) as i16,
-                    Y: (height as i32 / 20).max(10) as i16,
+                    X: cols as i16,
+                    Y: rows as i16,
                 },
             );
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            let dpi = (wparam.0 & 0xffff) as u32;
+            update_font(state, dpi);
+            InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == CURSOR_TIMER => {
+            state.cursor_visible = !state.cursor_visible;
+            InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
         WM_SETCURSOR => {
@@ -451,7 +490,7 @@ unsafe extern "system" fn terminal_wnd_proc(
             let old = SelectObject(hdc, state.font.into());
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, COLORREF(0x00E6E6E6));
-            draw_terminal_text(hdc, &state.text, &rect);
+            draw_terminal_screen(hdc, state, &rect);
             SelectObject(hdc, old);
             EndPaint(hwnd, &paint);
             LRESULT(0)
@@ -474,40 +513,166 @@ fn send_input(handle: HANDLE, bytes: &[u8]) {
     let _ = unsafe { WriteFile(handle, Some(bytes), Some(&mut written), None) };
 }
 
-fn clean_terminal_output(raw: &str) -> String {
-    let mut result = String::with_capacity(raw.len());
-    let mut escape = false;
-    for ch in raw.chars() {
-        if escape {
-            if ch.is_ascii_alphabetic() || ch == 'm' || ch == '~' {
-                escape = false;
-            }
-            continue;
-        }
-        if ch == '\x1b' {
-            escape = true;
-            continue;
-        }
-        if ch == '\r' {
-            continue;
-        }
-        if ch == '\x07' {
-            continue;
-        }
-        result.push(ch);
+fn key_sequence(key: u16) -> Option<&'static [u8]> {
+    match key {
+        k if k == VK_RETURN.0 as u16 => Some(b"\r"),
+        k if k == VK_BACK.0 as u16 => Some(b"\x7f"),
+        k if k == VK_TAB.0 as u16 => Some(b"\t"),
+        k if k == VK_ESCAPE.0 as u16 => Some(b"\x1b"),
+        k if k == VK_UP.0 as u16 => Some(b"\x1b[A"),
+        k if k == VK_DOWN.0 as u16 => Some(b"\x1b[B"),
+        k if k == VK_RIGHT.0 as u16 => Some(b"\x1b[C"),
+        k if k == VK_LEFT.0 as u16 => Some(b"\x1b[D"),
+        k if k == VK_HOME.0 as u16 => Some(b"\x1b[H"),
+        k if k == VK_END.0 as u16 => Some(b"\x1b[F"),
+        k if k == VK_PRIOR.0 as u16 => Some(b"\x1b[5~"),
+        k if k == VK_NEXT.0 as u16 => Some(b"\x1b[6~"),
+        k if k == VK_F1.0 as u16 => Some(b"\x1bOP"),
+        k if k == VK_F2.0 as u16 => Some(b"\x1bOQ"),
+        k if k == VK_F3.0 as u16 => Some(b"\x1bOR"),
+        k if k == VK_F4.0 as u16 => Some(b"\x1bOS"),
+        k if k == VK_F5.0 as u16 => Some(b"\x1b[15~"),
+        k if k == VK_F6.0 as u16 => Some(b"\x1b[17~"),
+        _ => None,
     }
-    result
 }
 
-fn draw_terminal_text(hdc: HDC, text: &str, rect: &RECT) {
-    let line_height = 24;
-    let max_lines = ((rect.bottom - rect.top) / line_height).max(1) as usize;
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
-    for (index, line) in lines[start..].iter().enumerate() {
-        let wide: Vec<u16> = line.encode_utf16().collect();
-        unsafe {
-            TextOutW(hdc, 14, 10 + (index as i32 * line_height), &wide);
+fn update_font(state: &mut HostState, dpi: u32) {
+    let dpi = dpi.max(96);
+    unsafe {
+        let _ = DeleteObject(state.font.into());
+    }
+    state.font = unsafe {
+        CreateFontW(
+            -(18 * dpi as i32 / 96),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            windows::Win32::Graphics::Gdi::FONT_CHARSET(0),
+            windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+            windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+            windows::Win32::Graphics::Gdi::FONT_QUALITY(0),
+            0,
+            w!("Cascadia Mono"),
+        )
+    };
+    state.dpi = dpi;
+    state.cell_width = 11 * dpi as i32 / 96;
+    state.cell_height = 24 * dpi as i32 / 96;
+}
+
+fn terminal_color(color: VtColor, foreground: bool) -> COLORREF {
+    let default = if foreground {
+        (230, 230, 230)
+    } else {
+        (0, 0, 0)
+    };
+    let (r, g, b) = match color {
+        VtColor::Default => default,
+        VtColor::Rgb(r, g, b) => (r, g, b),
+        VtColor::Idx(index) => ansi_palette(index),
+    };
+    COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
+}
+
+fn ansi_palette(index: u8) -> (u8, u8, u8) {
+    const BASIC: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 49, 49),
+        (13, 188, 121),
+        (229, 229, 16),
+        (36, 114, 200),
+        (188, 63, 188),
+        (17, 168, 205),
+        (229, 229, 229),
+        (102, 102, 102),
+        (241, 76, 76),
+        (35, 209, 139),
+        (245, 245, 67),
+        (59, 142, 234),
+        (214, 112, 214),
+        (41, 184, 219),
+        (255, 255, 255),
+    ];
+    if index < 16 {
+        return BASIC[index as usize];
+    }
+    if index >= 232 {
+        let v = 8 + (index - 232) * 10;
+        return (v, v, v);
+    }
+    let n = index - 16;
+    let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+    (level(n / 36), level((n / 6) % 6), level(n % 6))
+}
+
+fn draw_terminal_screen(hdc: HDC, state: &HostState, _rect: &RECT) {
+    unsafe {
+        let screen = state.parser.screen();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        for row in 0..state.rows {
+            for col in 0..state.cols {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                let x = col as i32 * state.cell_width;
+                let y = row as i32 * state.cell_height;
+                let cell_rect = RECT {
+                    left: x,
+                    top: y,
+                    right: x + state.cell_width,
+                    bottom: y + state.cell_height,
+                };
+                let inverse = cell.inverse();
+                let bg_color = if inverse {
+                    terminal_color(cell.fgcolor(), true)
+                } else {
+                    terminal_color(cell.bgcolor(), false)
+                };
+                let fg_color = if inverse {
+                    terminal_color(cell.bgcolor(), false)
+                } else {
+                    terminal_color(cell.fgcolor(), true)
+                };
+                let bg = CreateSolidBrush(bg_color);
+                FillRect(hdc, &cell_rect, bg);
+                DeleteObject(bg.into());
+                let text = cell.contents();
+                if !text.is_empty() && !cell.is_wide_continuation() {
+                    SetTextColor(hdc, fg_color);
+                    let wide: Vec<u16> = text.encode_utf16().collect();
+                    TextOutW(hdc, x, y, &wide);
+                    if cell.underline() {
+                        let underline = RECT {
+                            left: x,
+                            top: y + state.cell_height - 2,
+                            right: x + state.cell_width,
+                            bottom: y + state.cell_height,
+                        };
+                        let brush = CreateSolidBrush(fg_color);
+                        FillRect(hdc, &underline, brush);
+                        DeleteObject(brush.into());
+                    }
+                }
+                if state.cursor_visible
+                    && !screen.hide_cursor()
+                    && row == cursor_row
+                    && col == cursor_col
+                {
+                    let cursor = CreateSolidBrush(COLORREF(0x00E6E6E6));
+                    FillRect(hdc, &cell_rect, cursor);
+                    DeleteObject(cursor.into());
+                    if !text.is_empty() {
+                        SetTextColor(hdc, COLORREF(0x00000000));
+                        let wide: Vec<u16> = text.encode_utf16().collect();
+                        TextOutW(hdc, x, y, &wide);
+                    }
+                }
+            }
         }
     }
 }
@@ -695,6 +860,11 @@ fn add_tray_icon(hwnd: HWND) -> NOTIFYICONDATAW {
 
 fn main() -> windows::core::Result<()> {
     let instance = unsafe { GetModuleHandleW(None)? };
+    let _ = unsafe {
+        windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+    };
     register_class(
         w!("VirtualDesktopController"),
         controller_wnd_proc,
@@ -741,7 +911,7 @@ fn main() -> windows::core::Result<()> {
                 Some(hwnd),
                 HOTKEY_BASE + id,
                 MOD_CONTROL | MOD_ALT,
-                '1' as u32 + id as u32,
+                VK_F1.0 as u32 + id as u32,
             )?;
         }
     }
