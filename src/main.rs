@@ -14,14 +14,20 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject,
-    InvalidateRect, SelectObject, SetBkMode, SetTextColor, TextOutW, BLACK_BRUSH, HBRUSH, HDC,
-    HFONT, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
+    DeleteDC, DeleteObject, EndPaint, FillRect, GetStockObject, InvalidateRect, SelectObject,
+    SetBkMode, SetTextColor, TextOutW, BLACK_BRUSH, HBRUSH, HDC, HFONT, PAINTSTRUCT, SRCCOPY,
+    TRANSPARENT,
 };
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, HPCON,
+};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
@@ -32,8 +38,8 @@ use windows::Win32::System::StationsAndDesktops::{
     DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, HDESK,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-    TerminateProcess, UpdateProcThreadAttribute, CREATE_UNICODE_ENVIRONMENT,
+    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, ResumeThread,
+    TerminateProcess, UpdateProcThreadAttribute, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW, STARTUPINFOW,
 };
@@ -52,10 +58,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOPMOST,
     IDC_ARROW, IDI_APPLICATION, MF_STRING, MSG, SWP_SHOWWINDOW, SW_SHOW, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_HOTKEY,
-    WM_KEYDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR,
-    WM_SIZE, WM_TIMER, WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
-    WS_POPUP,
+    TPM_LEFTALIGN, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_HOTKEY, WM_KEYDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETCURSOR, WM_SIZE, WM_TIMER, WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WM_TRAY: u32 = WM_USER + 1;
@@ -77,6 +83,7 @@ struct HostState {
     input_write: HANDLE,
     output_read: HANDLE,
     process: HANDLE,
+    job: HANDLE,
     pty: HPCON,
     font: HFONT,
     parser: Parser,
@@ -109,6 +116,7 @@ impl Drop for HostState {
     fn drop(&mut self) {
         unsafe {
             let _ = TerminateProcess(self.process, 0);
+            let _ = CloseHandle(self.job);
             let _ = CloseHandle(self.input_write);
             let _ = CloseHandle(self.output_read);
             ClosePseudoConsole(self.pty);
@@ -155,7 +163,9 @@ fn create_pipe_pair() -> windows::core::Result<(HANDLE, HANDLE)> {
     Ok((read, write))
 }
 
-fn launch_cmd(desktop_name: &str) -> windows::core::Result<(HANDLE, HANDLE, HANDLE, HPCON)> {
+fn launch_cmd(
+    desktop_name: &str,
+) -> windows::core::Result<(HANDLE, HANDLE, HANDLE, HANDLE, HPCON)> {
     let (input_read, input_write) = create_pipe_pair()?;
     let (output_read, output_write) = create_pipe_pair()?;
     unsafe {
@@ -207,6 +217,17 @@ fn launch_cmd(desktop_name: &str) -> windows::core::Result<(HANDLE, HANDLE, HAND
     let executable = to_wide(r"C:\Windows\System32\cmd.exe");
     let mut command = to_wide("\"C:\\Windows\\System32\\cmd.exe\" /D /Q");
     let mut desktop_name = to_wide(desktop_name);
+    let job = unsafe { CreateJobObjectW(None, None)? };
+    let mut job_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &job_info as *const _ as *const c_void,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )?;
+    }
     let mut startup = STARTUPINFOEXW {
         StartupInfo: STARTUPINFOW {
             cb: size_of::<STARTUPINFOEXW>() as u32,
@@ -223,7 +244,7 @@ fn launch_cmd(desktop_name: &str) -> windows::core::Result<(HANDLE, HANDLE, HAND
             None,
             None,
             false,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             None,
             None,
             &mut startup.StartupInfo,
@@ -232,13 +253,32 @@ fn launch_cmd(desktop_name: &str) -> windows::core::Result<(HANDLE, HANDLE, HAND
     };
     unsafe {
         DeleteProcThreadAttributeList(attributes);
-        HeapFree(heap, HEAP_FLAGS(0), Some(attributes.0 as *const c_void));
+        let _ = HeapFree(heap, HEAP_FLAGS(0), Some(attributes.0 as *const c_void));
     }
-    created?;
+    if let Err(error) = created {
+        unsafe {
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(input_write);
+            let _ = CloseHandle(output_read);
+            ClosePseudoConsole(pty);
+        }
+        return Err(error);
+    }
     unsafe {
+        if let Err(error) = AssignProcessToJobObject(job, process_info.hProcess) {
+            let _ = TerminateProcess(process_info.hProcess, 1);
+            let _ = CloseHandle(process_info.hThread);
+            let _ = CloseHandle(process_info.hProcess);
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(input_write);
+            let _ = CloseHandle(output_read);
+            ClosePseudoConsole(pty);
+            return Err(error);
+        }
+        ResumeThread(process_info.hThread);
         CloseHandle(process_info.hThread)?;
     }
-    Ok((input_write, output_read, process_info.hProcess, pty))
+    Ok((input_write, output_read, process_info.hProcess, job, pty))
 }
 
 fn host_thread(desktop: HDESK, desktop_name: String, ready_tx: mpsc::SyncSender<HostReady>) {
@@ -254,7 +294,7 @@ fn host_thread(desktop: HDESK, desktop_name: String, ready_tx: mpsc::SyncSender<
         }
         return;
     }
-    let (input_write, output_read, process, pty) = match launch_cmd(&desktop_name) {
+    let (input_write, output_read, process, job, pty) = match launch_cmd(&desktop_name) {
         Ok(value) => value,
         Err(error) => {
             let text = to_wide(&format!("无法启动终端: {error}"));
@@ -326,6 +366,7 @@ fn host_thread(desktop: HDESK, desktop_name: String, ready_tx: mpsc::SyncSender<
         input_write,
         output_read,
         process,
+        job,
         pty,
         font,
         parser: Parser::new(40, 120, 10_000),
@@ -474,6 +515,7 @@ unsafe extern "system" fn terminal_wnd_proc(
             InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
+        WM_ERASEBKGND => LRESULT(1),
         WM_SETCURSOR => {
             SetCursor(None);
             LRESULT(1)
@@ -484,14 +526,33 @@ unsafe extern "system" fn terminal_wnd_proc(
             let hdc = BeginPaint(hwnd, &mut paint);
             let mut rect = RECT::default();
             GetClientRect(hwnd, &mut rect);
+            // Paint into a memory surface and copy it once to eliminate the
+            // visible erase/draw flash caused by cell-by-cell rendering.
+            let back = CreateCompatibleDC(Some(hdc));
+            let bitmap = CreateCompatibleBitmap(hdc, rect.right.max(1), rect.bottom.max(1));
+            let old_bitmap = SelectObject(back, bitmap.into());
             let brush = CreateSolidBrush(COLORREF(0x00000000));
-            FillRect(hdc, &rect, brush);
+            FillRect(back, &rect, brush);
             DeleteObject(brush.into());
-            let old = SelectObject(hdc, state.font.into());
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, COLORREF(0x00E6E6E6));
-            draw_terminal_screen(hdc, state, &rect);
-            SelectObject(hdc, old);
+            let old = SelectObject(back, state.font.into());
+            SetBkMode(back, TRANSPARENT);
+            SetTextColor(back, COLORREF(0x00E6E6E6));
+            draw_terminal_screen(back, state, &rect);
+            SelectObject(back, old);
+            BitBlt(
+                hdc,
+                0,
+                0,
+                rect.right,
+                rect.bottom,
+                Some(back),
+                0,
+                0,
+                SRCCOPY,
+            );
+            SelectObject(back, old_bitmap);
+            DeleteObject(bitmap.into());
+            DeleteDC(back);
             EndPaint(hwnd, &paint);
             LRESULT(0)
         }
@@ -614,6 +675,9 @@ fn draw_terminal_screen(hdc: HDC, state: &HostState, _rect: &RECT) {
     unsafe {
         let screen = state.parser.screen();
         let (cursor_row, cursor_col) = screen.cursor_position();
+        // Backgrounds must be painted before glyphs. A CJK glyph occupies two
+        // cells; painting the continuation cell afterwards would erase half
+        // of the glyph.
         for row in 0..state.rows {
             for col in 0..state.cols {
                 let Some(cell) = screen.cell(row, col) else {
@@ -633,14 +697,29 @@ fn draw_terminal_screen(hdc: HDC, state: &HostState, _rect: &RECT) {
                 } else {
                     terminal_color(cell.bgcolor(), false)
                 };
-                let fg_color = if inverse {
+                let bg = CreateSolidBrush(bg_color);
+                FillRect(hdc, &cell_rect, bg);
+                DeleteObject(bg.into());
+            }
+        }
+        for row in 0..state.rows {
+            for col in 0..state.cols {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                let x = col as i32 * state.cell_width;
+                let y = row as i32 * state.cell_height;
+                let cell_rect = RECT {
+                    left: x,
+                    top: y,
+                    right: x + state.cell_width,
+                    bottom: y + state.cell_height,
+                };
+                let fg_color = if cell.inverse() {
                     terminal_color(cell.bgcolor(), false)
                 } else {
                     terminal_color(cell.fgcolor(), true)
                 };
-                let bg = CreateSolidBrush(bg_color);
-                FillRect(hdc, &cell_rect, bg);
-                DeleteObject(bg.into());
                 let text = cell.contents();
                 if !text.is_empty() && !cell.is_wide_continuation() {
                     SetTextColor(hdc, fg_color);

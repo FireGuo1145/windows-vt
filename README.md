@@ -9,6 +9,7 @@
 - 每个新 Desktop 启动一个由本程序创建的 ConPTY `cmd.exe` 宿主窗口。
 - 宿主窗口覆盖整个主屏幕，使用 GDI 绘制终端输出，并吞掉鼠标消息。
 - Desktop 只创建一次；切换回来时对应的 `cmd.exe` 进程和终端输出仍然保留。
+- 每个终端进程树都放入 Job Object，托盘退出时会回收 `cmd.exe` 及其子进程。
 - 默认 Desktop 的系统托盘菜单提供“退出”。如果当前在其他 Desktop，先按 `Ctrl+Alt+1` 返回默认 Desktop。
 
 ## 构建与运行
