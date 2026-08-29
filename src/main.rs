@@ -563,6 +563,10 @@ unsafe extern "system" fn terminal_wnd_proc(
         WM_NCDESTROY => {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             let _ = Box::from_raw(state_ptr);
+            // This window owns the host thread's message loop. Once the
+            // window is destroyed, let that loop return so shutdown join()
+            // cannot wait forever.
+            PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
